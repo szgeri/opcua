@@ -733,3 +733,7 @@ func (ch *Client) Abort(ctx context.Context) error {
 	ch.channel.Abort(ctx)
 	return nil
 }
+
+func (ch *Client) GetNamespaceURIs() []string {
+	return ch.channel.NamespaceURIs()
+}
