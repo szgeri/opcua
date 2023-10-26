@@ -3,7 +3,6 @@
 package ua
 
 import (
-	"fmt"
 	"reflect"
 	"sync"
 )
