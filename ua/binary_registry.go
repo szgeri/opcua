@@ -15,15 +15,16 @@ var (
 
 // RegisterBinaryEncodingID registers the type and id with the BinaryEncoder.
 func RegisterBinaryEncodingID(typ reflect.Type, id ExpandedNodeID) {
+	binaryEncodingTypes.LoadOrStore(id, typ)
+	binaryEncodingIDs.LoadOrStore(typ, id)
+	//if t, dup := binaryEncodingTypes.LoadOrStore(id, typ); dup && t != typ {
+	//	panic(fmt.Sprintf("RegisterBinaryEncodingID: registering duplicate types for %q: %s != %s", id, t, typ))
+	//}
 
-	if t, dup := binaryEncodingTypes.LoadOrStore(id, typ); dup && t != typ {
-		panic(fmt.Sprintf("RegisterBinaryEncodingID: registering duplicate types for %q: %s != %s", id, t, typ))
-	}
-
-	if n, dup := binaryEncodingIDs.LoadOrStore(typ, id); dup && n != id {
-		binaryEncodingTypes.Delete(id)
-		panic(fmt.Sprintf("RegisterBinaryEncodingID: registering duplicate ids for %s: %q != %q", typ, n, id))
-	}
+	//if n, dup := binaryEncodingIDs.LoadOrStore(typ, id); dup && n != id {
+	//	binaryEncodingTypes.Delete(id)
+	//	panic(fmt.Sprintf("RegisterBinaryEncodingID: registering duplicate ids for %s: %q != %q", typ, n, id))
+	//}
 
 }
 
