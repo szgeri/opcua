@@ -716,9 +716,9 @@ func (ch *Client) open(ctx context.Context) error {
 }
 
 // Close closes the session and secure channel.
-func (ch *Client) Close(ctx context.Context) error {
+func (ch *Client) Close(ctx context.Context, deleteSubscriptions bool) error {
 	var request = &ua.CloseSessionRequest{
-		DeleteSubscriptions: true,
+		DeleteSubscriptions: deleteSubscriptions,
 	}
 	_, err := ch.closeSession(ctx, request)
 	if err != nil {
