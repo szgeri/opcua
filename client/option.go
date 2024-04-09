@@ -224,3 +224,11 @@ func WithTrace() Option {
 		return nil
 	}
 }
+
+// ForcedEndpoint is when no matter what endpoint matches the security settings, the client uses the client supplied main endpoint.
+func WithForcedEndpoint() Option {
+	return func(c *Client) error {
+		c.forcedEndpoint = true
+		return nil
+	}
+}
