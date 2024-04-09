@@ -37,6 +37,7 @@ func Dial(ctx context.Context, endpointURL string, opts ...Option) (c *Client, e
 		tokenLifetime:     defaultTokenRequestedLifetime,
 		connectTimeout:    defaultConnectTimeout,
 		trace:             false,
+		forcedEndpoint:    false,
 	}
 
 	// apply each option to the default
@@ -91,7 +92,11 @@ func Dial(ctx context.Context, endpointURL string, opts ...Option) (c *Client, e
 	if selectedEndpoint == nil {
 		return nil, ua.BadUnexpectedError
 	}
-	cli.endpointURL = selectedEndpoint.EndpointURL
+	if cli.forcedEndpoint {
+		cli.endpointURL = endpointURL
+	} else {
+		cli.endpointURL = selectedEndpoint.EndpointURL
+	}
 	cli.securityPolicyURI = selectedEndpoint.SecurityPolicyURI
 	cli.securityMode = selectedEndpoint.SecurityMode
 	cli.serverCertificate = []byte(selectedEndpoint.ServerCertificate)
@@ -176,6 +181,7 @@ type Client struct {
 	suppressCertificateRevocationUnknown bool
 	connectTimeout                       int64
 	trace                                bool
+	forcedEndpoint                       bool
 }
 
 // EndpointURL gets the EndpointURL of the server.
