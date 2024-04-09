@@ -59,7 +59,7 @@ func Dial(ctx context.Context, endpointURL string, opts ...Option) (c *Client, e
 	// order endpoints by decreasing security level.
 	var orderedEndpoints = res.Endpoints
 	sort.Slice(orderedEndpoints, func(i, j int) bool {
-		return orderedEndpoints[i].SecurityLevel > orderedEndpoints[j].SecurityLevel
+		return orderedEndpoints[i].SecurityLevel < orderedEndpoints[j].SecurityLevel // first will be the "None" security policy if available
 	})
 
 	// if client certificate is not set then limit secuity policy to none
