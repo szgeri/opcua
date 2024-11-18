@@ -752,7 +752,20 @@ func (ch *Client) open(ctx context.Context) error {
 }
 
 // Close closes the session and secure channel.
-func (ch *Client) Close(ctx context.Context, deleteSubscriptions bool) error {
+func (ch *Client) Close(ctx context.Context) error {
+	var request = &ua.CloseSessionRequest{
+		DeleteSubscriptions: true,
+	}
+	_, err := ch.closeSession(ctx, request)
+	if err != nil {
+		return err
+	}
+	ch.channel.Close(ctx)
+	return nil
+}
+
+// Close closes the session and secure channel.
+func (ch *Client) CloseDeleteSubscriptions(ctx context.Context, deleteSubscriptions bool) error {
 	var request = &ua.CloseSessionRequest{
 		DeleteSubscriptions: deleteSubscriptions,
 	}
