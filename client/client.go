@@ -28,6 +28,7 @@ var (
 func Dial(ctx context.Context, endpointURL string, opts ...Option) (c *Client, err error) {
 
 	cli := &Client{
+		endpointURL:       endpointURL,
 		userIdentity:      ua.AnonymousIdentity{},
 		applicationName:   "application",
 		sessionTimeout:    defaultSessionTimeout,
@@ -36,6 +37,9 @@ func Dial(ctx context.Context, endpointURL string, opts ...Option) (c *Client, e
 		diagnosticsHint:   defaultDiagnosticsHint,
 		tokenLifetime:     defaultTokenRequestedLifetime,
 		connectTimeout:    defaultConnectTimeout,
+		maxBufferSize:     defaultMaxBufferSize,
+		maxMessageSize:    defaultMaxMessageSize,
+		maxChunkCount:     defaultMaxChunkCount,
 		trace:             false,
 		forcedEndpoint:    false,
 	}
@@ -90,17 +94,19 @@ func Dial(ctx context.Context, endpointURL string, opts ...Option) (c *Client, e
 		}
 	}
 	if selectedEndpoint == nil {
-		return nil, ua.BadUnexpectedError
+		return nil, ua.BadSecurityModeRejected
 	}
 	if cli.forcedEndpoint {
 		cli.endpointURL = endpointURL
 	} else {
 		cli.endpointURL = selectedEndpoint.EndpointURL
 	}
+
 	cli.securityPolicyURI = selectedEndpoint.SecurityPolicyURI
 	cli.securityMode = selectedEndpoint.SecurityMode
 	cli.serverCertificate = []byte(selectedEndpoint.ServerCertificate)
 	cli.userTokenPolicies = selectedEndpoint.UserIdentityTokens
+
 	cli.localDescription = ua.ApplicationDescription{
 		ApplicationName: ua.LocalizedText{Text: cli.applicationName},
 		ApplicationType: ua.ApplicationTypeClient,
@@ -109,9 +115,10 @@ func Dial(ctx context.Context, endpointURL string, opts ...Option) (c *Client, e
 
 	if len(cli.localCertificate) > 0 {
 		// if cert has URI then update local description
-		crt, _ := x509.ParseCertificate(cli.localCertificate)
-		if len(crt.URIs) > 0 {
-			cli.localDescription.ApplicationURI = crt.URIs[0].String()
+		if crts, err := x509.ParseCertificates(cli.localCertificate); err == nil && len(crts) > 0 {
+			if len(crts[0].URIs) > 0 {
+				cli.localDescription.ApplicationURI = crts[0].URIs[0].String()
+			}
 		}
 	}
 
@@ -136,6 +143,9 @@ func Dial(ctx context.Context, endpointURL string, opts ...Option) (c *Client, e
 		cli.timeoutHint,
 		cli.diagnosticsHint,
 		cli.tokenLifetime,
+		cli.maxBufferSize,
+		cli.maxMessageSize,
+		cli.maxChunkCount,
 		cli.trace)
 
 	// open session and read the namespace table
@@ -180,6 +190,9 @@ type Client struct {
 	suppressCertificateChainIncomplete   bool
 	suppressCertificateRevocationUnknown bool
 	connectTimeout                       int64
+	maxBufferSize                        uint32
+	maxMessageSize                       uint32
+	maxChunkCount                        uint32
 	trace                                bool
 	forcedEndpoint                       bool
 }
@@ -202,6 +215,21 @@ func (ch *Client) SecurityMode() ua.MessageSecurityMode {
 // SessionID gets the id of the current session.
 func (ch *Client) SessionID() ua.NodeID {
 	return ch.sessionID
+}
+
+// SessionTimeout gets the maximum number of milliseconds that the session will remain open without activity.
+func (ch *Client) SessionTimeout() float64 {
+	return ch.sessionTimeout
+}
+
+// MaxRequestMessageSize gets the maximum size for the body of any request message. Zero equals no limit.
+func (ch *Client) MaxRequestMessageSize() uint32 {
+	return ch.channel.maxRequestMessageSize
+}
+
+// IsClosing returns true when the client is closing.
+func (ch *Client) IsClosing() bool {
+	return ch.channel.IsClosing()
 }
 
 // Request sends a service request to the server and returns the response.
@@ -236,6 +264,8 @@ func (ch *Client) open(ctx context.Context) error {
 	ch.sessionID = createSessionResponse.SessionID
 	ch.channel.SetAuthenticationToken(createSessionResponse.AuthenticationToken)
 	remoteNonce = []byte(createSessionResponse.ServerNonce)
+	ch.sessionTimeout = createSessionResponse.RevisedSessionTimeout
+	ch.channel.maxRequestMessageSize = createSessionResponse.MaxRequestMessageSize
 
 	// verify the server's certificate is the same as the certificate from the selected endpoint.
 	if !bytes.Equal(ch.serverCertificate, []byte(createSessionResponse.ServerCertificate)) {
@@ -352,8 +382,8 @@ func (ch *Client) open(ctx context.Context) error {
 			if publickey == nil {
 				return ua.BadIdentityTokenRejected
 			}
-			plainBuf := buffer.NewPartitionAt(bufferPool)
-			cipherBuf := buffer.NewPartitionAt(bufferPool)
+			plainBuf := buffer.NewPartitionAt(ch.channel.bufferPool)
+			cipherBuf := buffer.NewPartitionAt(ch.channel.bufferPool)
 			binary.Write(plainBuf, binary.LittleEndian, uint32(len(ui.TokenData)+len(remoteNonce)))
 			plainBuf.Write([]byte(ui.TokenData))
 			plainBuf.Write(remoteNonce)
@@ -383,8 +413,8 @@ func (ch *Client) open(ctx context.Context) error {
 			if publickey == nil {
 				return ua.BadIdentityTokenRejected
 			}
-			plainBuf := buffer.NewPartitionAt(bufferPool)
-			cipherBuf := buffer.NewPartitionAt(bufferPool)
+			plainBuf := buffer.NewPartitionAt(ch.channel.bufferPool)
+			cipherBuf := buffer.NewPartitionAt(ch.channel.bufferPool)
 			binary.Write(plainBuf, binary.LittleEndian, uint32(len(ui.TokenData)+len(remoteNonce)))
 			plainBuf.Write([]byte(ui.TokenData))
 			plainBuf.Write(remoteNonce)
@@ -414,8 +444,8 @@ func (ch *Client) open(ctx context.Context) error {
 			if publickey == nil {
 				return ua.BadIdentityTokenRejected
 			}
-			plainBuf := buffer.NewPartitionAt(bufferPool)
-			cipherBuf := buffer.NewPartitionAt(bufferPool)
+			plainBuf := buffer.NewPartitionAt(ch.channel.bufferPool)
+			cipherBuf := buffer.NewPartitionAt(ch.channel.bufferPool)
 			binary.Write(plainBuf, binary.LittleEndian, uint32(len(ui.TokenData)+len(remoteNonce)))
 			plainBuf.Write([]byte(ui.TokenData))
 			plainBuf.Write(remoteNonce)
@@ -553,8 +583,8 @@ func (ch *Client) open(ctx context.Context) error {
 			if publickey == nil {
 				return ua.BadIdentityTokenRejected
 			}
-			plainBuf := buffer.NewPartitionAt(bufferPool)
-			cipherBuf := buffer.NewPartitionAt(bufferPool)
+			plainBuf := buffer.NewPartitionAt(ch.channel.bufferPool)
+			cipherBuf := buffer.NewPartitionAt(ch.channel.bufferPool)
 			binary.Write(plainBuf, binary.LittleEndian, uint32(len(passwordBytes)+len(remoteNonce)))
 			plainBuf.Write(passwordBytes)
 			plainBuf.Write(remoteNonce)
@@ -586,8 +616,8 @@ func (ch *Client) open(ctx context.Context) error {
 			if publickey == nil {
 				return ua.BadIdentityTokenRejected
 			}
-			plainBuf := buffer.NewPartitionAt(bufferPool)
-			cipherBuf := buffer.NewPartitionAt(bufferPool)
+			plainBuf := buffer.NewPartitionAt(ch.channel.bufferPool)
+			cipherBuf := buffer.NewPartitionAt(ch.channel.bufferPool)
 			binary.Write(plainBuf, binary.LittleEndian, uint32(len(passwordBytes)+len(remoteNonce)))
 			plainBuf.Write(passwordBytes)
 			plainBuf.Write(remoteNonce)
@@ -619,8 +649,8 @@ func (ch *Client) open(ctx context.Context) error {
 			if publickey == nil {
 				return ua.BadIdentityTokenRejected
 			}
-			plainBuf := buffer.NewPartitionAt(bufferPool)
-			cipherBuf := buffer.NewPartitionAt(bufferPool)
+			plainBuf := buffer.NewPartitionAt(ch.channel.bufferPool)
+			cipherBuf := buffer.NewPartitionAt(ch.channel.bufferPool)
 			binary.Write(plainBuf, binary.LittleEndian, uint32(len(passwordBytes)+len(remoteNonce)))
 			plainBuf.Write(passwordBytes)
 			plainBuf.Write(remoteNonce)

@@ -27,6 +27,14 @@ import (
 )
 
 const (
+	// documents the version of binary protocol that this library supports.
+	protocolVersion uint32 = 0
+	// defaultMaxBufferSize is the default limit on the size of the send and receive buffers.
+	defaultMaxBufferSize uint32 = 64 * 1024
+	// defaultMaxMessageSize is the default limit on the size of messages that may be accepted.
+	defaultMaxMessageSize uint32 = 64 * 1024 * 1024
+	// defaultMaxChunkCount is the default limit on the number of message chunks that may be accepted.
+	defaultMaxChunkCount uint32 = 4 * 1024
 	// sequenceHeaderSize is the size of the sequence header
 	sequenceHeaderSize int = 8
 	// the minimum number of milliseconds that a Token may be used before being renewed by the client. (5 min)
@@ -56,24 +64,22 @@ type serverSecureChannel struct {
 	discoveryOnly               bool
 	sendingSemaphore            sync.Mutex
 	receivingSemaphore          sync.Mutex
-	responseCh                  chan struct {
-		ua.ServiceResponse
-		uint32
-	}
-	lastSequenceNumber         uint32
-	pendingTokenID             uint32
-	pendingTokenExpiration     time.Time
-	tokenID                    uint32
-	tokenExpiration            time.Time
-	localSigningKey            []byte
-	localEncryptingKey         []byte
-	localInitializationVector  []byte
-	remoteSigningKey           []byte
-	remoteEncryptingKey        []byte
-	remoteInitializationVector []byte
-	encryptionBuffer           []byte
-	sendBuffer                 []byte
-	receiveBuffer              []byte
+	lastSequenceNumber          uint32
+	pendingTokenID              uint32
+	pendingTokenExpiration      time.Time
+	tokenID                     uint32
+	tokenExpiration             time.Time
+	localSigningKey             []byte
+	localEncryptingKey          []byte
+	localInitializationVector   []byte
+	remoteSigningKey            []byte
+	remoteEncryptingKey         []byte
+	remoteInitializationVector  []byte
+	encryptionBuffer            []byte
+	sendBuffer                  []byte
+	receiveBuffer               []byte
+	bytesPool                   sync.Pool
+	bufferPool                  buffer.PoolAt
 
 	symSignHMAC   hash.Hash
 	symVerifyHMAC hash.Hash
@@ -82,30 +88,34 @@ type serverSecureChannel struct {
 	symDecryptingBlockCipher cipher.Block
 	trace                    bool
 
-	receiveBufferSize uint32
-	sendBufferSize    uint32
-	maxMessageSize    uint32
-	maxChunkCount     uint32
-	endpointURL       string
-	conn              net.Conn
+	receiveBufferSize      uint32
+	sendBufferSize         uint32
+	maxResponseMessageSize uint32
+	maxResponseChunkCount  uint32
+	maxRequestMessageSize  uint32
+	maxRequestChunkCount   uint32
+	endpointURL            string
+	conn                   net.Conn
 }
 
 // newServerSecureChannel initializes a new instance of the UaTcpSecureChannel.
-func newServerSecureChannel(srv *Server, conn net.Conn, receiveBufferSize, sendBufferSize, maxMessageSize, maxChunkCount uint32, trace bool) *serverSecureChannel {
+func newServerSecureChannel(srv *Server, conn net.Conn, trace bool) *serverSecureChannel {
 	ch := &serverSecureChannel{
-		srv:               srv,
-		conn:              conn,
-		receiveBufferSize: receiveBufferSize,
-		sendBufferSize:    sendBufferSize,
-		maxMessageSize:    maxMessageSize,
-		maxChunkCount:     maxChunkCount,
-		trace:             trace,
-		channelID:         srv.getNextChannelID(),
-		securityPolicyURI: ua.SecurityPolicyURINone,
-		securityPolicy:    new(ua.SecurityPolicyNone),
-		localCertificate:  srv.localCertificate,
-		localPrivateKey:   srv.localPrivateKey,
-		tokenExpiration:   time.Now().Add(20 * time.Second),
+		srv:                   srv,
+		conn:                  conn,
+		receiveBufferSize:     srv.maxBufferSize,
+		sendBufferSize:        srv.maxBufferSize,
+		maxRequestMessageSize: srv.maxMessageSize,
+		maxRequestChunkCount:  srv.maxChunkCount,
+		bytesPool:             sync.Pool{New: func() any { s := make([]byte, srv.maxBufferSize); return &s }},
+		bufferPool:            buffer.NewMemPoolAt(int64(srv.maxBufferSize)),
+		trace:                 trace,
+		channelID:             srv.getNextChannelID(),
+		securityPolicyURI:     ua.SecurityPolicyURINone,
+		securityPolicy:        new(ua.SecurityPolicyNone),
+		localCertificate:      srv.localCertificate,
+		localPrivateKey:       srv.localPrivateKey,
+		tokenExpiration:       time.Now().Add(20 * time.Second),
 	}
 	return ch
 }
@@ -162,34 +172,6 @@ func (ch *serverSecureChannel) SecurityMode() ua.MessageSecurityMode {
 	return ch.securityMode
 }
 
-// LocalReceiveBufferSize gets the size of the local receive buffer.
-func (ch *serverSecureChannel) LocalReceiveBufferSize() uint32 {
-	ch.RLock()
-	defer ch.RUnlock()
-	return ch.receiveBufferSize
-}
-
-// LocalSendBufferSize gets the size of the local send buffer.
-func (ch *serverSecureChannel) LocalSendBufferSize() uint32 {
-	ch.RLock()
-	defer ch.RUnlock()
-	return ch.sendBufferSize
-}
-
-// LocalMaxMessageSize gets the maximum size of message that may be received by the local endpoint.
-func (ch *serverSecureChannel) LocalMaxMessageSize() uint32 {
-	ch.RLock()
-	defer ch.RUnlock()
-	return ch.maxMessageSize
-}
-
-// LocalMaxChunkCount gets the maximum number of chunks that may be received by the local endpoint.
-func (ch *serverSecureChannel) LocalMaxChunkCount() uint32 {
-	ch.RLock()
-	defer ch.RUnlock()
-	return ch.maxChunkCount
-}
-
 // IsExpired returns true if the life of the current Token is exceeded.
 func (ch *serverSecureChannel) IsExpired() bool {
 	ch.RLock()
@@ -203,8 +185,8 @@ func (ch *serverSecureChannel) Open() error {
 	defer ch.Unlock()
 
 	// log.Printf("Opening secure channel.\n")
-	buf := *(bytesPool.Get().(*[]byte))
-	defer bytesPool.Put(&buf)
+	buf := *(ch.bytesPool.Get().(*[]byte))
+	defer ch.bytesPool.Put(&buf)
 	ch.conn.SetDeadline(ch.tokenExpiration)
 	_, err := ch.read(buf)
 	if err != nil {
@@ -224,34 +206,31 @@ func (ch *serverSecureChannel) Open() error {
 		return ua.BadDecodingError
 	}
 
-	var remoteProtocolVersion, remoteReceiveBufferSize, remoteSendBufferSize, remoteMaxMessageSize, remoteMaxChunkCount uint32
+	var cliProtocolVersion, cliReceiveBufferSize, cliSendBufferSize, cliMaxMessageSize, cliMaxChunkCount uint32
 	switch msgType {
 	case ua.MessageTypeHello:
 		if msgLen < 28 {
 			return ua.BadDecodingError
 		}
-		if err != nil {
-			return ua.BadDecodingError
-		}
-		if err = dec.ReadUInt32(&remoteProtocolVersion); err != nil || remoteProtocolVersion < protocolVersion {
+		if err = dec.ReadUInt32(&cliProtocolVersion); err != nil || cliProtocolVersion < protocolVersion {
 			return ua.BadProtocolVersionUnsupported
 		}
-		if err = dec.ReadUInt32(&remoteReceiveBufferSize); err != nil {
+		if err = dec.ReadUInt32(&cliReceiveBufferSize); err != nil {
 			return ua.BadDecodingError
 		}
-		if err = dec.ReadUInt32(&remoteSendBufferSize); err != nil {
+		if err = dec.ReadUInt32(&cliSendBufferSize); err != nil {
 			return ua.BadDecodingError
 		}
-		if err = dec.ReadUInt32(&remoteMaxMessageSize); err != nil {
+		if err = dec.ReadUInt32(&cliMaxMessageSize); err != nil {
 			return ua.BadDecodingError
 		}
-		if err = dec.ReadUInt32(&remoteMaxChunkCount); err != nil {
+		if err = dec.ReadUInt32(&cliMaxChunkCount); err != nil {
 			return ua.BadDecodingError
 		}
 		if err := dec.ReadString(&ch.endpointURL); err != nil {
 			return ua.BadDecodingError
 		}
-		// log.Printf("-> Hello { ver: %d, rec: %d, snd: %d, msg: %d, chk: %d, ep: %s }\n", remoteProtocolVersion, ch.remoteReceiveBufferSize, ch.remoteSendBufferSize, ch.remoteMaxMessageSize, ch.remoteMaxChunkCount, ch.endpointUrl)
+		// log.Printf("-> Hello { ver: %d, rec: %d, snd: %d, msg: %d, chk: %d, ep: %s }\n", remoteProtocolVersion, remoteReceiveBufferSize, remoteSendBufferSize, remoteMaxMessageSize, remoteMaxChunkCount, ch.endpointURL)
 
 	default:
 		return ua.BadDecodingError
@@ -260,42 +239,34 @@ func (ch *serverSecureChannel) Open() error {
 	var writer = ua.NewWriter(buf)
 	var enc = ua.NewBinaryEncoder(writer, ec)
 
-	// limit the receive buffer to what the sender can send
-	if ch.receiveBufferSize > remoteSendBufferSize {
-		ch.receiveBufferSize = remoteSendBufferSize
+	// limit the receive buffer to what the client can send
+	if ch.receiveBufferSize > cliSendBufferSize {
+		ch.receiveBufferSize = cliSendBufferSize
 	}
-	// limit the send buffer to what the receiver can receive
-	if ch.sendBufferSize > remoteReceiveBufferSize {
-		ch.sendBufferSize = remoteReceiveBufferSize
+	// limit the send buffer to what the client can receive
+	if ch.sendBufferSize > cliReceiveBufferSize {
+		ch.sendBufferSize = cliReceiveBufferSize
 	}
-	// limit the max message size to what the receiver can receive
-	if remoteMaxMessageSize > 0 && ch.maxMessageSize > remoteMaxMessageSize {
-		ch.maxMessageSize = remoteMaxMessageSize
-	}
-	// limit the max chunk count to what the receiver can receive
-	if remoteMaxChunkCount > 0 && ch.maxChunkCount > remoteMaxChunkCount {
-		ch.maxChunkCount = remoteMaxChunkCount
-	}
+	// limit the max response message size to what the client can receive
+	ch.maxResponseMessageSize = cliMaxMessageSize
+	// limit the max response chunk count to what the client can receive
+	ch.maxResponseChunkCount = cliMaxChunkCount
 	enc.WriteUInt32(ua.MessageTypeAck)
 	enc.WriteUInt32(uint32(28))
 	enc.WriteUInt32(protocolVersion)
 	enc.WriteUInt32(ch.receiveBufferSize)
 	enc.WriteUInt32(ch.sendBufferSize)
-	enc.WriteUInt32(ch.maxMessageSize)
-	enc.WriteUInt32(ch.maxChunkCount)
+	enc.WriteUInt32(ch.maxRequestMessageSize)
+	enc.WriteUInt32(ch.maxRequestChunkCount)
 	_, err = ch.write(writer.Bytes())
 	if err != nil {
 		return ua.BadEncodingError
 	}
-	// log.Printf("<- Ack { ver: %d, rec: %d, snd: %d, msg: %d, chk: %d, ep: %s }\n", protocolVersion, ch.receiveBufferSize, ch.sendBufferSize, ch.maxMessageSize, ch.maxChunkCount, ch.conn.RemoteAddr())
+	// log.Printf("<- Ack { ver: %d, rec: %d, snd: %d, msg: %d, chk: %d, ep: %s }\n", protocolVersion, ch.receiveBufferSize, ch.sendBufferSize, ch.maxReqMessageSize, ch.maxReqChunkCount, ch.conn.RemoteAddr())
 
 	ch.sendBuffer = make([]byte, ch.sendBufferSize)
 	ch.receiveBuffer = make([]byte, ch.receiveBufferSize)
 	ch.encryptionBuffer = make([]byte, ch.sendBufferSize)
-	ch.responseCh = make(chan struct {
-		ua.ServiceResponse
-		uint32
-	}, 32)
 
 	// read first request, which must be an OpenSecureChannelRequest
 	req, rid, err := ch.readRequest()
@@ -345,12 +316,12 @@ func (ch *serverSecureChannel) Open() error {
 		if rc == nil {
 			return ua.BadSecurityChecksFailed
 		}
-		cert, err := x509.ParseCertificate(ch.remoteCertificate)
+		certs, err := x509.ParseCertificates(ch.remoteCertificate)
 		if err != nil {
 			return ua.BadSecurityChecksFailed
 		}
 		err = ua.ValidateCertificate(
-			cert,
+			certs,
 			[]x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 			"",
 			ch.srv.trustedCertsPath,
@@ -366,6 +337,7 @@ func (ch *serverSecureChannel) Open() error {
 		if err != nil {
 			return err
 		}
+		cert := certs[0]
 		ch.remotePublicKey = cert.PublicKey.(*rsa.PublicKey)
 		if len(cert.URIs) > 0 {
 			ch.remoteApplicationURI = cert.URIs[0].String()
@@ -425,8 +397,8 @@ func (ch *serverSecureChannel) Abort(reason ua.StatusCode, message string) error
 
 	// log.Printf("Aborting secure channel.\n")
 	if ch.conn != nil {
-		buf := *(bytesPool.Get().(*[]byte))
-		defer bytesPool.Put(&buf)
+		buf := *(ch.bytesPool.Get().(*[]byte))
+		defer ch.bytesPool.Put(&buf)
 		var writer = ua.NewWriter(buf)
 		var ec = ua.NewEncodingContext()
 		var enc = ua.NewBinaryEncoder(writer, ec)
@@ -460,7 +432,7 @@ func (ch *serverSecureChannel) Write(res ua.ServiceResponse, id uint32) error {
 func (ch *serverSecureChannel) sendOpenSecureChannelResponse(res *ua.OpenSecureChannelResponse, id uint32) error {
 	ch.sendingSemaphore.Lock()
 	defer ch.sendingSemaphore.Unlock()
-	var bodyStream = buffer.NewPartitionAt(bufferPool)
+	var bodyStream = buffer.NewPartitionAt(ch.bufferPool)
 	defer bodyStream.Reset()
 	var bodyEncoder = ua.NewBinaryEncoder(bodyStream, ch)
 
@@ -472,8 +444,8 @@ func (ch *serverSecureChannel) sendOpenSecureChannelResponse(res *ua.OpenSecureC
 		return ua.BadEncodingError
 	}
 
-	if i := int64(ch.maxMessageSize); i > 0 && bodyStream.Len() > i {
-		return ua.BadEncodingLimitsExceeded
+	if i := int64(ch.maxResponseMessageSize); i > 0 && bodyStream.Len() > i {
+		return ua.BadResponseTooLarge
 	}
 
 	// write chunks
@@ -482,8 +454,8 @@ func (ch *serverSecureChannel) sendOpenSecureChannelResponse(res *ua.OpenSecureC
 
 	for bodyCount > 0 {
 		chunkCount++
-		if i := int(ch.maxChunkCount); i > 0 && chunkCount > i {
-			return ua.BadEncodingLimitsExceeded
+		if i := int(ch.maxResponseChunkCount); i > 0 && chunkCount > i {
+			return ua.BadResponseTooLarge
 		}
 
 		var plainHeaderSize int
@@ -647,7 +619,7 @@ func (ch *serverSecureChannel) sendOpenSecureChannelResponse(res *ua.OpenSecureC
 func (ch *serverSecureChannel) sendServiceResponse(response ua.ServiceResponse, id uint32) error {
 	ch.sendingSemaphore.Lock()
 	defer ch.sendingSemaphore.Unlock()
-	var bodyStream = buffer.NewPartitionAt(bufferPool)
+	var bodyStream = buffer.NewPartitionAt(ch.bufferPool)
 	defer bodyStream.Reset()
 	var bodyEncoder = ua.NewBinaryEncoder(bodyStream, ch)
 
@@ -928,8 +900,8 @@ func (ch *serverSecureChannel) sendServiceResponse(response ua.ServiceResponse, 
 		return ua.BadEncodingError
 	}
 
-	if i := int64(ch.maxMessageSize); i > 0 && bodyStream.Len() > i {
-		return ua.BadEncodingLimitsExceeded
+	if i := int64(ch.maxResponseMessageSize); i > 0 && bodyStream.Len() > i {
+		return ua.BadResponseTooLarge
 	}
 
 	var chunkCount int
@@ -939,8 +911,8 @@ func (ch *serverSecureChannel) sendServiceResponse(response ua.ServiceResponse, 
 
 	for bodyCount > 0 {
 		chunkCount++
-		if i := int(ch.maxChunkCount); i > 0 && chunkCount > i {
-			return ua.BadEncodingLimitsExceeded
+		if i := int(ch.maxResponseChunkCount); i > 0 && chunkCount > i {
+			return ua.BadResponseTooLarge
 		}
 
 		var plainHeaderSize int
@@ -1065,7 +1037,7 @@ func (ch *serverSecureChannel) readRequest() (ua.ServiceRequest, uint32, error) 
 	var channelID uint32
 	var newTokenID uint32
 
-	var bodyStream = buffer.NewPartitionAt(bufferPool)
+	var bodyStream = buffer.NewPartitionAt(ch.bufferPool)
 	defer bodyStream.Reset()
 	var bodyDecoder = ua.NewBinaryDecoder(bodyStream, ch)
 
@@ -1075,8 +1047,8 @@ func (ch *serverSecureChannel) readRequest() (ua.ServiceRequest, uint32, error) 
 
 	for !isFinal {
 		chunkCount++
-		if i := int32(ch.maxChunkCount); i > 0 && chunkCount > i {
-			return nil, 0, ua.BadEncodingLimitsExceeded
+		if i := int32(ch.maxRequestChunkCount); i > 0 && chunkCount > i {
+			return nil, 0, ua.BadRequestTooLarge
 		}
 
 		count, err := ch.read(ch.receiveBuffer)
@@ -1293,8 +1265,8 @@ func (ch *serverSecureChannel) readRequest() (ua.ServiceRequest, uint32, error) 
 					return nil, 0, ua.BadSecurityChecksFailed
 				}
 
-				if crt, err := x509.ParseCertificate(ch.remoteCertificate); err == nil {
-					ch.remotePublicKey = crt.PublicKey.(*rsa.PublicKey)
+				if crts, err := x509.ParseCertificates(ch.remoteCertificate); err == nil && len(crts) > 0 {
+					ch.remotePublicKey = crts[0].PublicKey.(*rsa.PublicKey)
 				}
 
 				if ch.remotePublicKey == nil {
@@ -1381,8 +1353,8 @@ func (ch *serverSecureChannel) readRequest() (ua.ServiceRequest, uint32, error) 
 			return nil, 0, ua.BadUnknownResponse
 		}
 
-		if i := int64(ch.maxMessageSize); i > 0 && bodyStream.Len() > i {
-			return nil, 0, ua.BadEncodingLimitsExceeded
+		if i := int64(ch.maxRequestMessageSize); i > 0 && bodyStream.Len() > i {
+			return nil, 0, ua.BadRequestTooLarge
 		}
 	}
 

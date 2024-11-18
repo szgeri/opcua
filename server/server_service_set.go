@@ -12,7 +12,7 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"math"
-	"net/url"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -97,40 +97,6 @@ func (srv *Server) handleCreateSession(ch *serverSecureChannel, requestid uint32
 		ch.Abort(ua.BadSecurityPolicyRejected, "")
 		return nil
 	}
-	// check endpointurl hostname matches one of the certificate hostnames
-	valid := false
-	if crt, err := x509.ParseCertificate(srv.LocalCertificate()); err == nil {
-		if remoteURL, err := url.Parse(req.EndpointURL); err == nil {
-			hostname := remoteURL.Host
-			i := strings.Index(hostname, ":")
-			if i != -1 {
-				hostname = hostname[:i]
-			}
-			if err := crt.VerifyHostname(hostname); err == nil {
-				valid = true
-			}
-		}
-	}
-	if !valid {
-		srv.serverDiagnosticsSummary.SecurityRejectedSessionCount++
-		srv.serverDiagnosticsSummary.RejectedSessionCount++
-		srv.serverDiagnosticsSummary.SecurityRejectedRequestsCount++
-		srv.serverDiagnosticsSummary.RejectedRequestsCount++
-		err := ch.Write(
-			&ua.ServiceFault{
-				ResponseHeader: ua.ResponseHeader{
-					Timestamp:     time.Now(),
-					RequestHandle: req.RequestHandle,
-					ServiceResult: ua.BadCertificateHostNameInvalid,
-				},
-			},
-			requestid,
-		)
-		if err != nil {
-			return err
-		}
-		return nil
-	}
 	// check nonce
 	switch ch.SecurityPolicyURI() {
 	case ua.SecurityPolicyURIBasic128Rsa15, ua.SecurityPolicyURIBasic256, ua.SecurityPolicyURIBasic256Sha256,
@@ -139,8 +105,8 @@ func (srv *Server) handleCreateSession(ch *serverSecureChannel, requestid uint32
 		// check client application uri matches one of the client certificate's san.
 		valid := false
 		if appuri := req.ClientDescription.ApplicationURI; appuri != "" {
-			if crt, err := x509.ParseCertificate([]byte(req.ClientCertificate)); err == nil {
-				for _, crturi := range crt.URIs {
+			if crts, err := x509.ParseCertificates([]byte(req.ClientCertificate)); err == nil && len(crts) > 0 {
+				for _, crturi := range crts[0].URIs {
 					if crturi.String() == appuri {
 						valid = true
 						break
@@ -298,7 +264,7 @@ func (srv *Server) handleCreateSession(ch *serverSecureChannel, requestid uint32
 			ServerEndpoints:            srv.Endpoints(),
 			ServerSoftwareCertificates: nil,
 			ServerSignature:            serverSignature,
-			MaxRequestMessageSize:      0,
+			MaxRequestMessageSize:      srv.maxMessageSize,
 		},
 		requestid,
 	)
@@ -452,8 +418,8 @@ func (srv *Server) handleActivateSession(ch *serverSecureChannel, requestid uint
 		if secPolicyURI == "" {
 			secPolicyURI = ch.SecurityPolicyURI()
 		}
-		userCert, err := x509.ParseCertificate([]byte(userIdentityToken.CertificateData))
-		if err != nil {
+		userCerts, err := x509.ParseCertificates([]byte(userIdentityToken.CertificateData))
+		if err != nil || len(userCerts) == 0 {
 			srv.serverDiagnosticsSummary.SecurityRejectedSessionCount++
 			srv.serverDiagnosticsSummary.RejectedSessionCount++
 			srv.serverDiagnosticsSummary.SecurityRejectedRequestsCount++
@@ -473,7 +439,7 @@ func (srv *Server) handleActivateSession(ch *serverSecureChannel, requestid uint
 			}
 			return nil
 		}
-		userKey, ok := userCert.PublicKey.(*rsa.PublicKey)
+		userKey, ok := userCerts[0].PublicKey.(*rsa.PublicKey)
 		if !ok {
 			srv.serverDiagnosticsSummary.SecurityRejectedSessionCount++
 			srv.serverDiagnosticsSummary.RejectedSessionCount++
@@ -615,8 +581,8 @@ func (srv *Server) handleActivateSession(ch *serverSecureChannel, requestid uint
 				}
 				return nil
 			}
-			plainBuf := buffer.NewPartitionAt(bufferPool)
-			cipherBuf := buffer.NewPartitionAt(bufferPool)
+			plainBuf := buffer.NewPartitionAt(ch.bufferPool)
+			cipherBuf := buffer.NewPartitionAt(ch.bufferPool)
 			cipherBuf.Write(cipherBytes)
 			cipherText := make([]byte, int32(len(srv.localPrivateKey.D.Bytes())))
 			for cipherBuf.Len() > 0 {
@@ -675,8 +641,8 @@ func (srv *Server) handleActivateSession(ch *serverSecureChannel, requestid uint
 				}
 				return nil
 			}
-			plainBuf := buffer.NewPartitionAt(bufferPool)
-			cipherBuf := buffer.NewPartitionAt(bufferPool)
+			plainBuf := buffer.NewPartitionAt(ch.bufferPool)
+			cipherBuf := buffer.NewPartitionAt(ch.bufferPool)
 			cipherBuf.Write(cipherBytes)
 			cipherText := make([]byte, int32(len(srv.localPrivateKey.D.Bytes())))
 			for cipherBuf.Len() > 0 {
@@ -735,8 +701,8 @@ func (srv *Server) handleActivateSession(ch *serverSecureChannel, requestid uint
 				}
 				return nil
 			}
-			plainBuf := buffer.NewPartitionAt(bufferPool)
-			cipherBuf := buffer.NewPartitionAt(bufferPool)
+			plainBuf := buffer.NewPartitionAt(ch.bufferPool)
+			cipherBuf := buffer.NewPartitionAt(ch.bufferPool)
 			cipherBuf.Write(cipherBytes)
 			cipherText := make([]byte, int32(len(srv.localPrivateKey.D.Bytes())))
 			for cipherBuf.Len() > 0 {
@@ -6034,13 +6000,24 @@ func (srv *Server) writeValue(session *Session, writeValue ua.WriteValue) ua.Sta
 					return ua.BadTypeMismatch
 				}
 			default:
-				// case ua.ExtensionObject:
-				if destType != ua.VariantTypeExtensionObject && destType != ua.VariantTypeVariant {
+				switch v3 := reflect.ValueOf(v2); v3.Kind() {
+				case reflect.Struct:
+					// case ua.ExtensionObject:
+					if destType != ua.VariantTypeExtensionObject && destType != ua.VariantTypeVariant {
+						return ua.BadTypeMismatch
+					}
+					if destRank != ua.ValueRankScalar && destRank != ua.ValueRankScalarOrOneDimension && destRank != ua.ValueRankAny {
+						return ua.BadTypeMismatch
+					}
+				case reflect.Slice, reflect.Array:
+					//TODO: check destType
+					if destRank == ua.ValueRankScalar {
+						return ua.BadTypeMismatch
+					}
+				default:
 					return ua.BadTypeMismatch
 				}
-				if destRank != ua.ValueRankScalar && destRank != ua.ValueRankScalarOrOneDimension && destRank != ua.ValueRankAny {
-					return ua.BadTypeMismatch
-				}
+
 			}
 
 			if f := n1.writeValueHandler; f != nil {
